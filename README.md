@@ -10,17 +10,23 @@ Create an integration layer that pulls production data recorded by CAD/CAM SQL S
    - Transforms data into normalized payloads, including CNC program completion outcomes and inspection/rework metadata.
    - Pushes batched payloads to the cloud API via HTTPS using tenant-scoped API keys or client certificates.
    - Handles retries, offline buffering, and per-record acknowledgements.
-2. **Ingestion & API Service (cloud)**
+2. **CNC Validation Edge App (shop-floor)**
+   - Raspberry Pi kiosk with attached barcode scanner that captures the CNC program ID from work orders/fixtures.
+   - Pulls down expected program metadata/tooling list, guides operators through validation, and records completion or rework decisions.
+   - Sends `cnc_runs` and `quality_checks` payloads to the cloud API (direct HTTPS or proxied via the on-prem agent when outbound egress is locked down).
+3. **Ingestion & API Service (cloud)**
    - Verifies payload signatures/keys and writes data into the operational store (PostgreSQL or SQL Server in Azure).
    - Emits events to a message bus (e.g., Azure Service Bus, Kafka) for downstream processing.
    - Exposes REST/GraphQL endpoints for dashboard consumption.
-3. **Dashboard (web)**
+4. **Dashboard (web)**
    - React/Next.js SPA backed by the API service.
    - Provides live status, historical analytics, and alerting hooks.
    - Enforces tenant isolation by deriving access scopes from the identity provider (customer users only see their own data).
 
 ```
-CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboard
+CAD/CAM SQL Server --> On-prem Agent
+                           |
+Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboard
 ```
 
 ## Component Breakdown
@@ -35,6 +41,17 @@ CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --
   2. Retrieves tenant config from the cloud API using a one-time enrollment code.
   3. Stores encrypted credentials in OS key store and writes operational config to disk.
   4. Registers host fingerprint so the control plane can monitor heartbeats.
+
+### CNC Validation Edge App (Raspberry Pi)
+- **Hardware:** Raspberry Pi 4 (PoE optional) + 7" touch display + USB/serial barcode scanner + status LEDs.
+- **Stack:** Python (FastAPI + PyQt/Remi) or Node.js (Electron/React) running kiosk mode; integrates with the scanner via HID or serial.
+- **Workflow:**
+  1. Operator scans barcode on traveler/fixture; kiosk resolves the program/job via cached manifest from the API.
+  2. App displays required tooling/fixtures and prompts operator to confirm setup steps.
+  3. Upon CNC completion, operator rescans or selects result (pass/fail/rework) and optionally attaches defect photos/notes.
+  4. Device posts `cnc_runs` + `quality_checks` payloads; if offline, queues them locally (SQLite) until network returns.
+- **Security:** Device enrolled per-tenant, uses device-bound client certificate/JWT, enforces kiosk login (badge/PIN) if operator attribution is required.
+- **Management:** Remote OTA updates via Ansible/Azure IoT Device Update; health heartbeats reported to control plane.
 
 ### Cloud API Service
 - **Identity/Access:** Every API call is tied to a tenant ID resolved from the presented credential. Middleware enforces tenant-based row-level security.
@@ -89,9 +106,10 @@ CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --
 - Observability dashboards and alert channels are filtered per tenant to avoid cross-contamination.
 
 ## Next Steps
-1. Define exact CAD/CAM tables and required fields.
-2. Prototype agent polling + delta tracking against staging SQL Server.
-3. Implement tenant onboarding service + enrollment code issuance.
-4. Scaffold FastAPI service with auth + payload validation.
-5. Stand up dashboard skeleton consuming mock API data w/ tenant scopes.
-6. Add monitoring (Azure App Insights, Grafana) and alerting workflows.
+1. Define exact CAD/CAM tables and required fields (machines, jobs, CNC runs, QC/rework outcomes).
+2. Prototype agent polling + delta tracking against staging SQL Server, ensuring CNC completion and inspection signals are captured.
+3. Build the Raspberry Pi kiosk prototype: barcode scanning workflow, offline queue, secure enrollment with tenant credentials.
+4. Implement tenant onboarding service + enrollment code issuance for both the data agent and kiosk devices.
+5. Scaffold FastAPI service with auth, payload validation, CNC run + QC endpoints, and tenant-aware metrics.
+6. Stand up dashboard skeleton consuming mock API data w/ tenant scopes, rework KPIs, and failure trend widgets.
+7. Add monitoring (Azure App Insights, Grafana) and alerting workflows (notify managers when fail % crosses threshold).
