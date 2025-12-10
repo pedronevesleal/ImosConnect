@@ -10,15 +10,18 @@ Create an integration layer that pulls production data recorded by CAD/CAM SQL S
    - Transforms data into normalized payloads, including CNC program completion outcomes and inspection/rework metadata.
    - Pushes batched payloads to the cloud API via HTTPS using tenant-scoped API keys or client certificates.
    - Handles retries, offline buffering, and per-record acknowledgements.
-2. **CNC Validation Edge App (shop-floor)**
-   - Raspberry Pi kiosk with attached barcode scanner that captures the CNC program ID from work orders/fixtures.
-   - Pulls down expected program metadata/tooling list, guides operators through validation, and records completion or rework decisions.
-   - Sends `cnc_runs` and `quality_checks` payloads to the cloud API (direct HTTPS or proxied via the on-prem agent when outbound egress is locked down).
+2. **CNC Validation & Station Edge Apps (shop-floor)**
+   - Network of Raspberry Pi kiosks with attached barcode/RFID scanners per station (panel saw, edge bander, drill, finishing, QC).
+   - Scanning an order label updates the station workflow status (e.g., “Order 123 cutting”, “Edge banding with color X”), displays tailored instructions, and captures completion/rework states.
+   - Sends `cnc_runs`, `station_events`, `quality_checks`, and attachment metadata to the cloud API (direct HTTPS or proxied via the on-prem agent when outbound egress is locked down).
 3. **Ingestion & API Service (cloud)**
    - Verifies payload signatures/keys and writes data into the operational store (PostgreSQL or SQL Server in Azure).
    - Emits events to a message bus (e.g., Azure Service Bus, Kafka) for downstream processing.
    - Exposes REST/GraphQL endpoints for dashboard consumption.
-4. **Dashboard (web)**
+4. **Notification & Document Service**
+   - Handles alert rules (order completion, overdue rework, stalled stations) and dispatches messages via email/SMS/Teams/Webhooks per tenant preferences.
+   - Stores documents (DWG, images, PDFs) in secure blob storage with signed URLs, linked to orders/jobs/stations.
+5. **Dashboard (web)**
    - React/Next.js SPA backed by the API service.
    - Provides live status, historical analytics, and alerting hooks.
    - Enforces tenant isolation by deriving access scopes from the identity provider (customer users only see their own data).
@@ -26,7 +29,11 @@ Create an integration layer that pulls production data recorded by CAD/CAM SQL S
 ```
 CAD/CAM SQL Server --> On-prem Agent
                            |
-Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboard
+  Multiple Station Kiosks (Pi + scanners) --> HTTPS --> Cloud API --> DB/Event Bus
+                                                               |            |
+                                                       Document Store   Alert Service
+                                                               \            /
+                                                                ---> Dashboard
 ```
 
 ## Component Breakdown
@@ -36,22 +43,25 @@ Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboar
 - **Resilience:** Local LiteDB/SQLite queue for temporary storage when offline.
 - **Security:** Mutual TLS + signed JWT with short-lived credentials; tenant-scoped API key rotated per customer.
 - **Config:** YAML/ENV for table mappings, polling intervals, endpoint URLs, tenant ID, client secret, SQL credentials.
+- **Document Sync:** Watches configured network shares for new DWG/PDF exports tied to CAD jobs, uploads them to blob storage via signed URLs, and links metadata to orders.
 - **Provisioning Flow:** IT admin runs `imos-agent setup` which:
   1. Prompts for CAD/CAM SQL connection info and tests connectivity.
   2. Retrieves tenant config from the cloud API using a one-time enrollment code.
   3. Stores encrypted credentials in OS key store and writes operational config to disk.
   4. Registers host fingerprint so the control plane can monitor heartbeats.
 
-### CNC Validation Edge App (Raspberry Pi)
-- **Hardware:** Raspberry Pi 4 (PoE optional) + 7" touch display + USB/serial barcode scanner + status LEDs.
-- **Stack:** Python (FastAPI + PyQt/Remi) or Node.js (Electron/React) running kiosk mode; integrates with the scanner via HID or serial.
+### CNC Validation & Station Edge Apps (Raspberry Pi)
+- **Hardware:** Raspberry Pi 4 (PoE optional) + 7" touch display + USB/serial barcode or RFID scanner + status LEDs + optional camera for photo capture.
+- **Stack:** Python (FastAPI + PyQt/Remi) or Node.js (Electron/React) running kiosk mode; integrates with scanners via HID/serial and cameras via V4L2.
+- **Station Profiles:** Panel saw, edge bander, drill/router, finishing, packaging, QC—each profile defines prompts, required documents, and completion criteria.
 - **Workflow:**
-  1. Operator scans barcode on traveler/fixture; kiosk resolves the program/job via cached manifest from the API.
-  2. App displays required tooling/fixtures and prompts operator to confirm setup steps.
-  3. Upon CNC completion, operator rescans or selects result (pass/fail/rework) and optionally attaches defect photos/notes.
-  4. Device posts `cnc_runs` + `quality_checks` payloads; if offline, queues them locally (SQLite) until network returns.
-- **Security:** Device enrolled per-tenant, uses device-bound client certificate/JWT, enforces kiosk login (badge/PIN) if operator attribution is required.
-- **Management:** Remote OTA updates via Ansible/Azure IoT Device Update; health heartbeats reported to control plane.
+  1. Operator scans barcode on traveler/fixture; kiosk resolves the order/job/station step via cached manifest from the API.
+  2. App displays station-specific instructions (cut list, edging color, tooling, safety checks) and embedded previews of drawings/images retrieved from document storage.
+  3. Operator confirms start to emit a `station_events` update (“cutting started”), enabling live WIP tracking.
+  4. Upon completion, operator rescans or selects result (pass/fail/rework) and optionally uploads photos/notes; kiosk can capture additional QC data or trigger rework tickets.
+  5. Device posts `cnc_runs`, `station_events`, `quality_checks`, and document references; if offline, queues them locally (SQLite) until network returns.
+- **Security:** Device enrolled per tenant, uses device-bound client certificate/JWT, enforces kiosk login (badge/PIN) where operator attribution is required.
+- **Management:** Remote OTA updates via Ansible/Azure IoT Device Update; health heartbeats and station availability reported to control plane.
 
 ### Cloud API Service
 - **Identity/Access:** Every API call is tied to a tenant ID resolved from the presented credential. Middleware enforces tenant-based row-level security.
@@ -60,15 +70,31 @@ Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboar
   - `POST /v1/payloads`: bulk insert, idempotent via UUID batch ids, requires tenant-signed JWT.
   - `GET /v1/jobs/:id`: agent heartbeat & job configs filtered per tenant.
   - `GET /v1/metrics`: aggregated stats for dashboard widgets, scoped per tenant.
+- **Station Workflow & Alerts:**
+  - `POST /v1/stations/events`: records scan-in/scan-out events per station, order, and operator to drive WIP timelines.
+  - `GET /v1/stations`: returns registered stations/kiosks and their capabilities; used when provisioning new Pi devices.
+  - `POST /v1/alerts/rules`: define thresholds (e.g., “notify if rework pending > 30 min”) and recipients.
+  - `POST /v1/alerts/dispatch`: internal endpoint used by the rules engine to send notifications via email/SMS/Teams/webhooks.
 - **CNC Validation Feature:**
   - `POST /v1/cnc-runs`: records every CNC program execution with outcome (`PASSED`, `FAILED`, `REWORK_REQUIRED`), offsets, and operator notes.
   - `POST /v1/quality-checks`: logs inspection checkpoints, defects discovered, corrective instructions, and completion timestamps.
   - `GET /v1/rework-queue`: returns prioritized list of parts requiring rework plus SLA counters.
+- **Document & Media Handling:**
+  - `POST /v1/documents/upload-url`: generates short-lived signed URLs for kiosks/agents to upload DWG, PDF, or image files to blob storage.
+  - `GET /v1/documents/:id`: metadata endpoint returning access URLs scoped per tenant/order/station.
+  - Supports virus scanning and retention policies prior to making files available to kiosks or dashboards.
 - **Processing:**
   - Validate schema against Pydantic/JSON Schema.
-  - Persist to `production_events`, `machines`, `jobs`, `operators`, `cnc_runs`, and `quality_checks` tables.
-  - Publish normalized events to queue for analytics pipeline.
+  - Persist to `production_events`, `machines`, `jobs`, `operators`, `cnc_runs`, `quality_checks`, `stations`, `station_events`, and `documents` tables.
+  - Publish normalized events to queue for analytics pipeline and notification workers.
 - **Observability:** Structured logging, OpenTelemetry traces, Prometheus metrics.
+
+### Notification & Document Service
+- **Alert Engine:** Cron/stream processors evaluate rules (e.g., “order not moved in 30 minutes”, “rework queue > 5 items”) and enqueue alert jobs.
+- **Channels:** Email (SMTP/SendGrid), SMS (Twilio), Teams/Slack webhooks, push notifications for kiosk/dashboards.
+- **Templates:** Tenant-customizable templates with merge fields for order ID, machine, ETA, attachments.
+- **Document Storage:** Azure Blob/AWS S3 per-tenant buckets with encryption-at-rest, lifecycle policies, and signed URL access.
+- **Metadata Sync:** Document metadata stored in the operational DB to link DWG/images to orders, machines, or station steps for kiosk retrieval.
 
 ### Dashboard
 - **Stack:** Next.js + Tailwind + Recharts (or Plotly) for charts.
@@ -78,6 +104,8 @@ Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboar
   - Filtering by date, machine, operator, job type.
   - Alert settings (threshold breaches trigger webhook/email).
   - Quality dashboard highlighting CNC completion validation: pass/fail %, open rework items, most common failure codes, per-machine trends.
+  - Station tracker showing where each order currently sits (cutting, edging, finishing) and dwell times per station.
+  - Document viewer for DWGs/images with quick links per order/station.
 - **Auth:** Azure AD / Auth0 multi-tenant configuration; login determines tenant context, roles (admin/operator/viewer) and permissible datasets.
 - **Tenant Isolation:** GraphQL/REST queries automatically include tenant ID claims so that UI cannot mix or leak data across customers.
 
@@ -90,6 +118,10 @@ Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboar
 | `operators` | `operator_id`, `name`, `shift` | Optional HR linkage.
 | `cnc_runs` | `run_id`, `machine_id`, `job_id`, `program_code`, `started_at`, `completed_at`, `result`, `failure_code` | CNC execution history + validation outcome.
 | `quality_checks` | `qc_id`, `run_id`, `inspector`, `status`, `defect_notes`, `rework_required`, `closed_at` | Inspection records tied to CNC runs.
+| `stations` | `station_id`, `name`, `type`, `location`, `device_id`, `tenant_id` | Configuration for each kiosk/station.
+| `station_events` | `event_id`, `station_id`, `order_id`, `status`, `operator`, `started_at`, `completed_at` | Logs progression of orders through stations.
+| `documents` | `doc_id`, `order_id`, `station_id`, `type`, `blob_path`, `version`, `uploaded_by` | Metadata for DWG/images/PDFs stored in blob storage.
+| `alerts` | `alert_id`, `tenant_id`, `rule_id`, `target`, `status`, `triggered_at`, `resolved_at` | Tracks alert dispatch history for auditing.
 
 ## Deployment Strategy
 - Agent packaged as Docker container or Windows Service (if machines run Windows).
@@ -108,8 +140,9 @@ Barcode Scanner + Pi Kiosk --> HTTPS --> Cloud API --> DB/Event Bus --> Dashboar
 ## Next Steps
 1. Define exact CAD/CAM tables and required fields (machines, jobs, CNC runs, QC/rework outcomes).
 2. Prototype agent polling + delta tracking against staging SQL Server, ensuring CNC completion and inspection signals are captured.
-3. Build the Raspberry Pi kiosk prototype: barcode scanning workflow, offline queue, secure enrollment with tenant credentials.
-4. Implement tenant onboarding service + enrollment code issuance for both the data agent and kiosk devices.
-5. Scaffold FastAPI service with auth, payload validation, CNC run + QC endpoints, and tenant-aware metrics.
-6. Stand up dashboard skeleton consuming mock API data w/ tenant scopes, rework KPIs, and failure trend widgets.
-7. Add monitoring (Azure App Insights, Grafana) and alerting workflows (notify managers when fail % crosses threshold).
+3. Build the Raspberry Pi kiosk prototype: multi-station configuration, barcode scanning workflow, document preview, offline queue, secure enrollment with tenant credentials.
+4. Implement tenant onboarding service + enrollment code issuance for both the data agent and kiosk devices, plus station registration APIs.
+5. Scaffold FastAPI service with auth, payload validation, CNC run + QC + station events + document upload endpoints, and tenant-aware metrics.
+6. Implement alerting pipeline (rules engine + notification channels) and integrate with dashboard for rule management.
+7. Stand up dashboard skeleton consuming mock API data w/ tenant scopes, rework KPIs, station tracker, and failure trend widgets.
+8. Add monitoring (Azure App Insights, Grafana) and alerting workflows (notify managers when fail % crosses threshold).
