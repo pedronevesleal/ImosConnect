@@ -21,7 +21,11 @@ Create an integration layer that pulls production data recorded by CAD/CAM SQL S
 4. **Notification & Document Service**
    - Handles alert rules (order completion, overdue rework, stalled stations) and dispatches messages via email/SMS/Teams/Webhooks per tenant preferences.
    - Stores documents (DWG, images, PDFs) in secure blob storage with signed URLs, linked to orders/jobs/stations.
-5. **Dashboard (web)**
+5. **Label & Reporting Service**
+   - Generates station-specific labels (cut parts, edge banding, CNC programs, assembly, shipping) using tenant-managed templates (ZPL, PDF, DYMO, etc.).
+   - Provides APIs to create print jobs triggered by scans or workflow transitions, with status feedback to kiosks/agents.
+   - Produces scheduled or on-demand reports (PDF/CSV) for parts, hardware, edge band procurement, inventory variance, and shipment manifests.
+6. **Dashboard (web)**
    - React/Next.js SPA backed by the API service.
    - Provides live status, historical analytics, and alerting hooks.
    - Enforces tenant isolation by deriving access scopes from the identity provider (customer users only see their own data).
@@ -32,7 +36,9 @@ CAD/CAM SQL Server --> On-prem Agent
   Multiple Station Kiosks (Pi + scanners) --> HTTPS --> Cloud API --> DB/Event Bus
                                                                |            |
                                                        Document Store   Alert Service
-                                                               \            /
+                                                               |            |
+                                                     Label/Report Engine |
+                                                               \          /
                                                                 ---> Dashboard
 ```
 
@@ -44,6 +50,7 @@ CAD/CAM SQL Server --> On-prem Agent
 - **Security:** Mutual TLS + signed JWT with short-lived credentials; tenant-scoped API key rotated per customer.
 - **Config:** YAML/ENV for table mappings, polling intervals, endpoint URLs, tenant ID, client secret, SQL credentials.
 - **Document Sync:** Watches configured network shares for new DWG/PDF exports tied to CAD jobs, uploads them to blob storage via signed URLs, and links metadata to orders.
+- **Label Integration:** Downloads tenant label templates and exposes hooks to local printers (ZPL, PDF, DYMO) so that stations can request prints even if offline; queues print jobs if the printer is unavailable.
 - **Provisioning Flow:** IT admin runs `imos-agent setup` which:
   1. Prompts for CAD/CAM SQL connection info and tests connectivity.
   2. Retrieves tenant config from the cloud API using a one-time enrollment code.
@@ -57,9 +64,10 @@ CAD/CAM SQL Server --> On-prem Agent
 - **Workflow:**
   1. Operator scans barcode on traveler/fixture; kiosk resolves the order/job/station step via cached manifest from the API.
   2. App displays station-specific instructions (cut list, edging color, tooling, safety checks) and embedded previews of drawings/images retrieved from document storage.
-  3. Operator confirms start to emit a `station_events` update (“cutting started”), enabling live WIP tracking.
-  4. Upon completion, operator rescans or selects result (pass/fail/rework) and optionally uploads photos/notes; kiosk can capture additional QC data or trigger rework tickets.
-  5. Device posts `cnc_runs`, `station_events`, `quality_checks`, and document references; if offline, queues them locally (SQLite) until network returns.
+  3. Operator can trigger label prints (cut labels, edge-band strips, CNC program summaries, assembly tags, shipping labels) directly from the kiosk; print job status is displayed on-screen.
+  4. Operator confirms start to emit a `station_events` update (“cutting started”), enabling live WIP tracking.
+  5. Upon completion, operator rescans or selects result (pass/fail/rework) and optionally uploads photos/notes; kiosk can capture additional QC data or trigger rework tickets.
+  6. Device posts `cnc_runs`, `station_events`, `quality_checks`, label print acknowledgements, and document references; if offline, queues them locally (SQLite) until network returns.
 - **Security:** Device enrolled per tenant, uses device-bound client certificate/JWT, enforces kiosk login (badge/PIN) where operator attribution is required.
 - **Management:** Remote OTA updates via Ansible/Azure IoT Device Update; health heartbeats and station availability reported to control plane.
 
@@ -83,6 +91,12 @@ CAD/CAM SQL Server --> On-prem Agent
   - `POST /v1/documents/upload-url`: generates short-lived signed URLs for kiosks/agents to upload DWG, PDF, or image files to blob storage.
   - `GET /v1/documents/:id`: metadata endpoint returning access URLs scoped per tenant/order/station.
   - Supports virus scanning and retention policies prior to making files available to kiosks or dashboards.
+- **Labels & Reports:**
+  - `GET /v1/label-templates`: list tenant templates (saw, edge band, CNC, assembly, shipping) along with required data bindings.
+  - `POST /v1/label-jobs`: submit label print jobs (single or batch) referencing an order/station; response includes job ID and printer routing rules.
+  - `GET /v1/label-jobs/:id`: track print job statuses and failures.
+  - `POST /v1/reports/run`: generate PDF/CSV reports for parts, hardware, edge materials to purchase, order completions, shipping manifests.
+  - `GET /v1/reports/:id/download`: retrieve generated files via signed URL; supports scheduled report definitions.
 - **Processing:**
   - Validate schema against Pydantic/JSON Schema.
   - Persist to `production_events`, `machines`, `jobs`, `operators`, `cnc_runs`, `quality_checks`, `stations`, `station_events`, and `documents` tables.
@@ -96,6 +110,13 @@ CAD/CAM SQL Server --> On-prem Agent
 - **Document Storage:** Azure Blob/AWS S3 per-tenant buckets with encryption-at-rest, lifecycle policies, and signed URL access.
 - **Metadata Sync:** Document metadata stored in the operational DB to link DWG/images to orders, machines, or station steps for kiosk retrieval.
 
+### Label & Reporting Service
+- **Template Management:** Supports uploading/managing ZPL, EPL, PDF, and HTML templates with versioning and per-station assignment (cutting, edge banding, CNC, assembly, shipping).
+- **Rendering Pipeline:** Uses server-side renderer (Labelary, PrintNode, Ghostscript) to merge job data with templates; outputs ZPL/PDF plus preview thumbnails for approval.
+- **Print Spooler:** Routes jobs to on-prem printers via the agent (for LAN-connected devices) or cloud print APIs; includes retries, acknowledgements, and error alerts.
+- **Report Generation:** Scheduled and ad-hoc jobs create PDF/CSV reports (parts to cut, edge band material requirements, hardware procurement, rework backlog, shipping manifests) and deliver them via email/download.
+- **API Hooks:** Exposes webhooks for ERP/WMS systems to request labels or retrieve generated reports programmatically.
+
 ### Dashboard
 - **Stack:** Next.js + Tailwind + Recharts (or Plotly) for charts.
 - **Features:**
@@ -106,6 +127,8 @@ CAD/CAM SQL Server --> On-prem Agent
   - Quality dashboard highlighting CNC completion validation: pass/fail %, open rework items, most common failure codes, per-machine trends.
   - Station tracker showing where each order currently sits (cutting, edging, finishing) and dwell times per station.
   - Document viewer for DWGs/images with quick links per order/station.
+  - Label center to monitor queued/failed print jobs and reprint shipping or assembly tags.
+  - Reporting hub to schedule/download PDF/CSV exports for procurement, production, and logistics stakeholders.
 - **Auth:** Azure AD / Auth0 multi-tenant configuration; login determines tenant context, roles (admin/operator/viewer) and permissible datasets.
 - **Tenant Isolation:** GraphQL/REST queries automatically include tenant ID claims so that UI cannot mix or leak data across customers.
 
@@ -122,6 +145,9 @@ CAD/CAM SQL Server --> On-prem Agent
 | `station_events` | `event_id`, `station_id`, `order_id`, `status`, `operator`, `started_at`, `completed_at` | Logs progression of orders through stations.
 | `documents` | `doc_id`, `order_id`, `station_id`, `type`, `blob_path`, `version`, `uploaded_by` | Metadata for DWG/images/PDFs stored in blob storage.
 | `alerts` | `alert_id`, `tenant_id`, `rule_id`, `target`, `status`, `triggered_at`, `resolved_at` | Tracks alert dispatch history for auditing.
+| `label_templates` | `template_id`, `name`, `station_type`, `format`, `version`, `blob_path` | Stores label layouts per tenant.
+| `label_jobs` | `job_id`, `template_id`, `order_id`, `station_id`, `printer`, `status`, `payload`, `requested_at`, `completed_at` | Lifecycle of label print requests.
+| `reports` | `report_id`, `type`, `filters`, `format`, `status`, `generated_at`, `requested_by`, `download_url` | Metadata for generated PDF/CSV reports.
 
 ## Deployment Strategy
 - Agent packaged as Docker container or Windows Service (if machines run Windows).
@@ -144,5 +170,6 @@ CAD/CAM SQL Server --> On-prem Agent
 4. Implement tenant onboarding service + enrollment code issuance for both the data agent and kiosk devices, plus station registration APIs.
 5. Scaffold FastAPI service with auth, payload validation, CNC run + QC + station events + document upload endpoints, and tenant-aware metrics.
 6. Implement alerting pipeline (rules engine + notification channels) and integrate with dashboard for rule management.
-7. Stand up dashboard skeleton consuming mock API data w/ tenant scopes, rework KPIs, station tracker, and failure trend widgets.
-8. Add monitoring (Azure App Insights, Grafana) and alerting workflows (notify managers when fail % crosses threshold).
+7. Deliver label & reporting service MVP: template storage, print job routing via agent/kiosks, PDF/CSV generator for procurement/logistics.
+8. Stand up dashboard skeleton consuming mock API data w/ tenant scopes, rework KPIs, station tracker, label/report monitors, and failure trend widgets.
+9. Add monitoring (Azure App Insights, Grafana) and alerting workflows (notify managers when fail % crosses threshold).
