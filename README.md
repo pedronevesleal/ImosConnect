@@ -3,6 +3,35 @@
 ## Goal
 Create an integration layer that pulls production data recorded by CAD/CAM SQL Server instances hosted on customer sites, forwards it to a multi-tenant cloud API, and presents the synchronized information through an authenticated dashboard.
 
+## MVP Scope
+Focus the first iteration on three deliverables that prove the end-to-end sync loop before expanding into stations, alerts, and labeling:
+
+1. **On-Prem Data Agent (v1)**
+   - Poll a single CAD/CAM SQL Server instance for `machines`, `jobs`, and `production_events` changes using timestamp columns.
+   - Batch payloads and push to the cloud API over HTTPS with tenant API key auth.
+   - Provide a CLI setup (`imos-agent setup`) that collects SQL credentials, tenant ID, and API endpoint, writes encrypted config, and runs as a Windows Service/Linux daemon.
+
+2. **Cloud API Service (v1)**
+   - FastAPI service with endpoints:
+     - `POST /v1/payloads` to ingest batched `machines`, `jobs`, `production_events`.
+     - `POST /v1/agents/heartbeat` to capture agent health status and last sync cursor.
+     - `GET /v1/summary` to return aggregate stats for the dashboard.
+   - Persist incoming data to Postgres tables with tenant scoping.
+   - Basic auth via API keys for agents and JWT/OAuth for dashboard users.
+
+3. **Dashboard (v1)**
+   - Next.js app that authenticates via Auth0/Azure AD (single tenant for MVP is acceptable).
+   - Pages:
+     - Overview: cards for total jobs, machines online/offline, events in last 24h.
+     - Jobs list: table filtered by status with search.
+     - Agent status: display last heartbeat, last successful sync, errors.
+   - Consume data from the `/v1/summary` and `/v1/jobs` (mock or minimal) endpoints.
+
+### MVP Success Criteria
+- A customer can install the agent, point it to their SQL Server + tenant, and see newly recorded jobs/events appear on the dashboard within a defined latency (e.g., <1 min).
+- API enforces tenant authentication and stores data durably.
+- Dashboard visualizes live stats without manual refresh.
+
 ## High-Level Architecture
 1. **Data Agent (on-premises)**
    - Customer-specific deployment (Windows Service or container) that reads new/changed rows from local CAD/CAM SQL Server tables.
