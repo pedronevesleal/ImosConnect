@@ -7,7 +7,7 @@ Create an integration layer that pulls production data recorded by CAD/CAM SQL S
 1. **Data Agent (on-premises)**
    - Customer-specific deployment (Windows Service or container) that reads new/changed rows from local CAD/CAM SQL Server tables.
    - Includes a bootstrap wizard/CLI to capture customer tenant ID, API credentials, polling intervals, and SQL connection strings.
-   - Transforms data into normalized payloads.
+   - Transforms data into normalized payloads, including CNC program completion outcomes and inspection/rework metadata.
    - Pushes batched payloads to the cloud API via HTTPS using tenant-scoped API keys or client certificates.
    - Handles retries, offline buffering, and per-record acknowledgements.
 2. **Ingestion & API Service (cloud)**
@@ -36,15 +36,20 @@ CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --
   3. Stores encrypted credentials in OS key store and writes operational config to disk.
   4. Registers host fingerprint so the control plane can monitor heartbeats.
 
+### Cloud API Service
 - **Identity/Access:** Every API call is tied to a tenant ID resolved from the presented credential. Middleware enforces tenant-based row-level security.
 - **Framework:** FastAPI / .NET Minimal APIs / NestJS.
 - **Endpoints:**
   - `POST /v1/payloads`: bulk insert, idempotent via UUID batch ids, requires tenant-signed JWT.
   - `GET /v1/jobs/:id`: agent heartbeat & job configs filtered per tenant.
   - `GET /v1/metrics`: aggregated stats for dashboard widgets, scoped per tenant.
+- **CNC Validation Feature:**
+  - `POST /v1/cnc-runs`: records every CNC program execution with outcome (`PASSED`, `FAILED`, `REWORK_REQUIRED`), offsets, and operator notes.
+  - `POST /v1/quality-checks`: logs inspection checkpoints, defects discovered, corrective instructions, and completion timestamps.
+  - `GET /v1/rework-queue`: returns prioritized list of parts requiring rework plus SLA counters.
 - **Processing:**
   - Validate schema against Pydantic/JSON Schema.
-  - Persist to `production_events`, `machines`, `jobs`, `operators` tables.
+  - Persist to `production_events`, `machines`, `jobs`, `operators`, `cnc_runs`, and `quality_checks` tables.
   - Publish normalized events to queue for analytics pipeline.
 - **Observability:** Structured logging, OpenTelemetry traces, Prometheus metrics.
 
@@ -55,6 +60,7 @@ CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --
   - Timeline of recent operations.
   - Filtering by date, machine, operator, job type.
   - Alert settings (threshold breaches trigger webhook/email).
+  - Quality dashboard highlighting CNC completion validation: pass/fail %, open rework items, most common failure codes, per-machine trends.
 - **Auth:** Azure AD / Auth0 multi-tenant configuration; login determines tenant context, roles (admin/operator/viewer) and permissible datasets.
 - **Tenant Isolation:** GraphQL/REST queries automatically include tenant ID claims so that UI cannot mix or leak data across customers.
 
@@ -65,6 +71,8 @@ CAD/CAM SQL Server --> On-prem Agent --> HTTPS --> Cloud API --> DB/Event Bus --
 | `jobs` | `job_id`, `cad_reference`, `scheduled_start`, `status` | Links to CAD entities.
 | `production_events` | `event_id`, `machine_id`, `job_id`, `event_type`, `payload`, `occurred_at` | Append-only stream from agent.
 | `operators` | `operator_id`, `name`, `shift` | Optional HR linkage.
+| `cnc_runs` | `run_id`, `machine_id`, `job_id`, `program_code`, `started_at`, `completed_at`, `result`, `failure_code` | CNC execution history + validation outcome.
+| `quality_checks` | `qc_id`, `run_id`, `inspector`, `status`, `defect_notes`, `rework_required`, `closed_at` | Inspection records tied to CNC runs.
 
 ## Deployment Strategy
 - Agent packaged as Docker container or Windows Service (if machines run Windows).
